@@ -177,11 +177,15 @@ const inputStyle = {
 export default function Home() {
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [rental, setRental] = useState<RentalInfo>(initialRental);
-  const [form, setForm] = useState({ title: "", amount: "", paidBy: "Eduardo" as Person, category: "Monthly rent", note: "" });
+  const todayIso = new Date().toISOString().split("T")[0];
+  const [form, setForm] = useState({ title: "", amount: "", paidBy: "Eduardo" as Person, category: "Monthly rent", note: "", date: todayIso });
   const [filter, setFilter] = useState<"All" | Person>("All");
   const [activeTab, setActiveTab] = useState<"expenses" | "rental" | "calendar">("expenses");
   const [syncLabel, setSyncLabel] = useState(isFirebaseConfigured ? "Connecting…" : "Local mode");
   const [isAdding, setIsAdding] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState({ title: "", amount: "", paidBy: "Eduardo" as Person, category: "Monthly rent", note: "", date: todayIso });
+  const [calendarAnchor, setCalendarAnchor] = useState(() => new Date().toISOString().split("T")[0]);
 
   // Firebase / localStorage sync
   useEffect(() => {
@@ -265,12 +269,12 @@ export default function Home() {
     return dates;
   }, [rental.chargeStartDate, rental.plannedMoveOutDate]);
 
-  const calendar = useMemo(() => buildCalendar(rental.moveInDate || rental.chargeStartDate), [rental.moveInDate, rental.chargeStartDate]);
+  const calendar = useMemo(() => buildCalendar(calendarAnchor), [calendarAnchor]);
 
   async function handleAddExpense(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const amt = parseFloat(form.amount);
-    if (!form.title.trim() || isNaN(amt) || amt <= 0) return;
+    if (!form.title.trim() || isNaN(amt) || amt === 0) return;
     const next: Expense = {
       id: crypto.randomUUID(),
       title: form.title.trim(),
@@ -278,19 +282,46 @@ export default function Home() {
       paidBy: form.paidBy,
       category: form.category || "Misc",
       note: form.note.trim(),
-      createdAt: new Date().toISOString().split("T")[0],
+      createdAt: form.date || todayIso,
     };
-    const nextList = [next, ...expenses];
+    const nextList = [next, ...expenses].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     setExpenses(nextList);
     await persist(nextList, rental);
-    setForm({ title: "", amount: "", paidBy: "Eduardo", category: "Monthly rent", note: "" });
+    setForm({ title: "", amount: "", paidBy: "Eduardo", category: "Monthly rent", note: "", date: todayIso });
     setIsAdding(false);
+  }
+
+  function startEdit(e: Expense) {
+    setEditingId(e.id);
+    setEditForm({ title: e.title, amount: String(e.amount), paidBy: e.paidBy, category: e.category, note: e.note, date: e.createdAt });
+    setIsAdding(false);
+  }
+
+  async function handleSaveEdit(ev: FormEvent<HTMLFormElement>) {
+    ev.preventDefault();
+    if (!editingId) return;
+    const amt = parseFloat(editForm.amount);
+    if (!editForm.title.trim() || isNaN(amt) || amt === 0) return;
+    const nextList = expenses
+      .map((e) => e.id === editingId ? { ...e, title: editForm.title.trim(), amount: amt, paidBy: editForm.paidBy, category: editForm.category, note: editForm.note.trim(), createdAt: editForm.date || todayIso } : e)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    setExpenses(nextList);
+    await persist(nextList, rental);
+    setEditingId(null);
   }
 
   async function handleDelete(id: string) {
     const next = expenses.filter((e) => e.id !== id);
     setExpenses(next);
     await persist(next, rental);
+  }
+
+  function stepMonth(delta: number) {
+    setCalendarAnchor((prev) => {
+      const d = new Date(prev + "T12:00:00");
+      d.setMonth(d.getMonth() + delta);
+      return d.toISOString().split("T")[0];
+    });
   }
 
   async function updateRental<K extends keyof RentalInfo>(k: K, v: RentalInfo[K]) {
@@ -425,11 +456,10 @@ export default function Home() {
                       />
                     </InputField>
                     <div className="grid grid-cols-2 gap-3">
-                      <InputField label="Amount ($)">
+                      <InputField label="Amount (negative = refund)">
                         <input
                           type="number"
                           inputMode="decimal"
-                          min="0"
                           step="0.01"
                           placeholder="0.00"
                           value={form.amount}
@@ -448,6 +478,14 @@ export default function Home() {
                       </InputField>
                     </div>
                     <div className="grid grid-cols-2 gap-3">
+                      <InputField label="Date">
+                        <input
+                          type="date"
+                          value={form.date}
+                          onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))}
+                          style={{ ...inputStyle, colorScheme: "dark" }}
+                        />
+                      </InputField>
                       <InputField label="Category">
                         <select
                           value={form.category}
@@ -457,16 +495,16 @@ export default function Home() {
                           {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
                         </select>
                       </InputField>
-                      <InputField label="Note (optional)">
-                        <input
-                          type="text"
-                          placeholder="Any detail…"
-                          value={form.note}
-                          onChange={(e) => setForm((f) => ({ ...f, note: e.target.value }))}
-                          style={inputStyle}
-                        />
-                      </InputField>
                     </div>
+                    <InputField label="Note (optional)">
+                      <input
+                        type="text"
+                        placeholder="Any detail…"
+                        value={form.note}
+                        onChange={(e) => setForm((f) => ({ ...f, note: e.target.value }))}
+                        style={inputStyle}
+                      />
+                    </InputField>
                     <div className="flex gap-2 pt-1">
                       <button
                         type="button"
@@ -517,23 +555,84 @@ export default function Home() {
                 <div className="space-y-2">
                   {filtered.map((e) => {
                     const isEd = e.paidBy === "Eduardo";
+                    const isRefund = e.amount < 0;
+                    const isEditing = editingId === e.id;
+
+                    if (isEditing) {
+                      return (
+                        <GlassPanel key={e.id} className="p-4">
+                          <p className="text-xs font-semibold tracking-widest uppercase mb-3" style={{ color: "#22d3ee" }}>Edit transaction</p>
+                          <form onSubmit={handleSaveEdit} className="space-y-3">
+                            <InputField label="What was it for?">
+                              <input type="text" value={editForm.title} onChange={(ev) => setEditForm((f) => ({ ...f, title: ev.target.value }))} style={inputStyle} autoFocus />
+                            </InputField>
+                            <div className="grid grid-cols-2 gap-3">
+                              <InputField label="Amount (negative = refund)">
+                                <input type="number" inputMode="decimal" step="0.01" value={editForm.amount} onChange={(ev) => setEditForm((f) => ({ ...f, amount: ev.target.value }))} style={inputStyle} />
+                              </InputField>
+                              <InputField label="Who paid?">
+                                <select value={editForm.paidBy} onChange={(ev) => setEditForm((f) => ({ ...f, paidBy: ev.target.value as Person }))} style={inputStyle}>
+                                  {PEOPLE.map((p) => <option key={p} value={p}>{p}</option>)}
+                                </select>
+                              </InputField>
+                            </div>
+                            <div className="grid grid-cols-2 gap-3">
+                              <InputField label="Date">
+                                <input type="date" value={editForm.date} onChange={(ev) => setEditForm((f) => ({ ...f, date: ev.target.value }))} style={{ ...inputStyle, colorScheme: "dark" }} />
+                              </InputField>
+                              <InputField label="Category">
+                                <select value={editForm.category} onChange={(ev) => setEditForm((f) => ({ ...f, category: ev.target.value }))} style={inputStyle}>
+                                  {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                                </select>
+                              </InputField>
+                            </div>
+                            <InputField label="Note (optional)">
+                              <input type="text" placeholder="Any detail…" value={editForm.note} onChange={(ev) => setEditForm((f) => ({ ...f, note: ev.target.value }))} style={inputStyle} />
+                            </InputField>
+                            <div className="flex gap-2 pt-1">
+                              <button type="button" onClick={() => setEditingId(null)} className="flex-1 py-2.5 rounded-xl text-sm font-medium transition-all" style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8", border: "1px solid rgba(255,255,255,0.08)" }}>
+                                Cancel
+                              </button>
+                              <button type="button" onClick={() => { void handleDelete(e.id); setEditingId(null); }} className="py-2.5 px-4 rounded-xl text-sm font-medium transition-all hover:opacity-80" style={{ background: "rgba(248,113,113,0.12)", color: "#f87171", border: "1px solid rgba(248,113,113,0.2)" }}>
+                                Delete
+                              </button>
+                              <button type="submit" className="flex-1 py-2.5 rounded-xl text-sm font-semibold transition-all hover:opacity-90" style={{ background: "linear-gradient(135deg, #22d3ee, #818cf8)", color: "white" }}>
+                                Save
+                              </button>
+                            </div>
+                          </form>
+                        </GlassPanel>
+                      );
+                    }
+
                     return (
                       <GlassPanel key={e.id} className="p-4">
                         <div className="flex items-start justify-between gap-3">
-                          <div className="flex items-start gap-3 flex-1 min-w-0">
+                          <div className="flex items-start gap-3 flex-1 min-w-0" onClick={() => startEdit(e)} style={{ cursor: "pointer" }}>
                             <div
                               className="shrink-0 h-9 w-9 rounded-xl flex items-center justify-center text-xs font-bold"
-                              style={isEd
+                              style={isRefund
+                                ? { background: "rgba(52,211,153,0.15)", color: "#34d399" }
+                                : isEd
                                 ? { background: "rgba(244,114,182,0.15)", color: "#f472b6" }
                                 : { background: "rgba(34,211,238,0.15)", color: "#22d3ee" }
                               }
                             >
-                              {e.paidBy[0]}
+                              {isRefund ? "↩" : e.paidBy[0]}
                             </div>
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center justify-between gap-2">
-                                <p className="text-sm font-semibold text-white truncate">{e.title}</p>
-                                <p className="text-sm font-bold shrink-0" style={{ color: "#e2e8f0" }}>{fmt(e.amount)}</p>
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <p className="text-sm font-semibold text-white truncate">{e.title}</p>
+                                  {isRefund && (
+                                    <span className="shrink-0 text-xs font-semibold rounded-full px-2 py-0.5" style={{ background: "rgba(52,211,153,0.15)", color: "#34d399" }}>
+                                      Refund
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-sm font-bold shrink-0" style={{ color: isRefund ? "#34d399" : "#e2e8f0" }}>
+                                  {isRefund ? `−${fmt(Math.abs(e.amount))}` : fmt(e.amount)}
+                                </p>
                               </div>
                               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5">
                                 <span className="text-xs" style={{ color: "#475569" }}>{e.category}</span>
@@ -545,13 +644,13 @@ export default function Home() {
                           </div>
                           <button
                             type="button"
-                            onClick={() => void handleDelete(e.id)}
-                            className="shrink-0 h-7 w-7 rounded-lg flex items-center justify-center transition-all hover:bg-red-500/20"
+                            onClick={() => startEdit(e)}
+                            className="shrink-0 h-7 w-7 rounded-lg flex items-center justify-center transition-all"
                             style={{ color: "#475569" }}
-                            aria-label={`Delete ${e.title}`}
+                            aria-label={`Edit ${e.title}`}
                           >
                             <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
                             </svg>
                           </button>
                         </div>
@@ -616,7 +715,43 @@ export default function Home() {
           {activeTab === "calendar" && (
             <div className="mt-4 space-y-3">
               <GlassPanel className="p-5">
-                <PanelHeader eyebrow="Calendar" title={calendar.label} badge="Key dates" />
+                {/* Month nav */}
+                <div className="flex items-center justify-between mb-5">
+                  <div>
+                    <p className="text-xs font-semibold tracking-widest uppercase mb-0.5" style={{ color: "#22d3ee" }}>Calendar</p>
+                    <h2 className="text-lg font-bold text-white">{calendar.label}</h2>
+                  </div>
+                  <div className="flex gap-1">
+                    <button
+                      type="button"
+                      onClick={() => stepMonth(-1)}
+                      className="h-9 w-9 rounded-xl flex items-center justify-center transition-all hover:opacity-80"
+                      style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8" }}
+                    >
+                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCalendarAnchor(new Date().toISOString().split("T")[0])}
+                      className="px-3 h-9 rounded-xl text-xs font-medium transition-all hover:opacity-80"
+                      style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8" }}
+                    >
+                      Today
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => stepMonth(1)}
+                      className="h-9 w-9 rounded-xl flex items-center justify-center transition-all hover:opacity-80"
+                      style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8" }}
+                    >
+                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
 
                 {/* Month grid */}
                 <div className="grid grid-cols-7 gap-px rounded-2xl overflow-hidden" style={{ background: "rgba(255,255,255,0.04)" }}>
@@ -628,10 +763,13 @@ export default function Home() {
                     const isBilling = billingDates.includes(cell.iso);
                     const isToday = cell.iso === new Date().toISOString().split("T")[0];
                     const highlight = match ?? (isBilling ? { color: "#22d3ee", label: "Billing" } : null);
+                    const dayExpenses = expenses.filter((ex) => ex.createdAt === cell.iso);
+                    const edExps = dayExpenses.filter((ex) => ex.paidBy === "Eduardo");
+                    const mExps = dayExpenses.filter((ex) => ex.paidBy === "Martha");
                     return (
                       <div
                         key={cell.iso}
-                        className="relative flex flex-col items-center py-2 px-1 min-h-[52px]"
+                        className="relative flex flex-col items-center py-2 px-1 min-h-[56px]"
                         style={{
                           background: highlight ? `${highlight.color}14` : undefined,
                           border: highlight ? `1px solid ${highlight.color}40` : undefined,
@@ -653,9 +791,33 @@ export default function Home() {
                             {highlight.label.split(" ")[0]}
                           </span>
                         )}
+                        {dayExpenses.length > 0 && cell.inMonth && (
+                          <div className="mt-auto pt-1 flex gap-0.5 justify-center flex-wrap">
+                            {edExps.map((ex) => (
+                              <span key={ex.id} className="h-1.5 w-1.5 rounded-full" style={{ background: ex.amount < 0 ? "#34d399" : "#f472b6" }} />
+                            ))}
+                            {mExps.map((ex) => (
+                              <span key={ex.id} className="h-1.5 w-1.5 rounded-full" style={{ background: ex.amount < 0 ? "#34d399" : "#22d3ee" }} />
+                            ))}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
+                </div>
+
+                {/* Dot legend */}
+                <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5">
+                  {[
+                    { color: "#f472b6", label: "Eduardo expense" },
+                    { color: "#22d3ee", label: "Martha expense" },
+                    { color: "#34d399", label: "Refund" },
+                  ].map((l) => (
+                    <span key={l.label} className="flex items-center gap-1.5 text-xs" style={{ color: "#64748b" }}>
+                      <span className="h-1.5 w-1.5 rounded-full" style={{ background: l.color }} />
+                      {l.label}
+                    </span>
+                  ))}
                 </div>
               </GlassPanel>
 
