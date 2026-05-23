@@ -5,18 +5,20 @@ import { onValue, ref, set } from "firebase/database";
 import { PasscodeGate } from "@/components/PasscodeGate";
 import { database, isFirebaseConfigured } from "@/lib/firebase";
 
-// ─── Types ──────────────────────────────────────────────────────────────────
-
-type Person = "Eduardo" | "Martha";
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 type Expense = {
   id: string;
   title: string;
   amount: number;
-  paidBy: Person;
+  paidBy: string;
   category: string;
   note: string;
   createdAt: string;
+  splitBetween?: string[];
+  splitWeights?: Record<string, number>;
+  dueNow?: boolean;
+  isPayment?: boolean;
 };
 
 type RentalInfo = {
@@ -27,6 +29,7 @@ type RentalInfo = {
   plannedMoveOutDate: string;
   unitLabel: string;
   note: string;
+  thirdPerson: string;
 };
 
 type DashboardPayload = {
@@ -34,12 +37,11 @@ type DashboardPayload = {
   rentalInfo: RentalInfo;
 };
 
-// ─── Constants ──────────────────────────────────────────────────────────────
+// ─── Constants ───────────────────────────────────────────────────────────────
 
 const STORAGE_KEY = "manhattan-mini-storage-v2";
 const DASHBOARD_REF = "manhattanMiniStorage/privateSummer2026EduardoMartha/dashboard";
-
-const PEOPLE: Person[] = ["Eduardo", "Martha"];
+const CORE_PEOPLE = ["Eduardo", "Martha"];
 
 const CATEGORIES = [
   "Monthly rent",
@@ -53,6 +55,16 @@ const CATEGORIES = [
   "Miscellaneous",
 ];
 
+const PALETTE = [
+  { gradient: "linear-gradient(90deg,#f472b6,#fb923c)", dot: "#f472b6", bg: "rgba(244,114,182,0.15)", text: "#f472b6" },
+  { gradient: "linear-gradient(90deg,#22d3ee,#818cf8)", dot: "#22d3ee", bg: "rgba(34,211,238,0.15)", text: "#22d3ee" },
+  { gradient: "linear-gradient(90deg,#34d399,#a78bfa)", dot: "#a78bfa", bg: "rgba(167,139,250,0.15)", text: "#a78bfa" },
+];
+
+function paletteFor(name: string, allPeople: string[]) {
+  const idx = allPeople.indexOf(name);
+  return PALETTE[idx >= 0 && idx < PALETTE.length ? idx : 0];
+}
 
 function initialRental(): RentalInfo {
   return {
@@ -63,6 +75,7 @@ function initialRental(): RentalInfo {
     plannedMoveOutDate: "",
     unitLabel: "",
     note: "",
+    thirdPerson: "",
   };
 }
 
@@ -76,6 +89,55 @@ const shortDate = (s: string) => {
   const d = new Date(s + "T12:00:00");
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 };
+
+function isExpenseDueNow(e: Expense, todayIso: string): boolean {
+  if (e.dueNow !== undefined) return e.dueNow;
+  return e.createdAt <= todayIso;
+}
+
+function effectiveSplit(e: Expense): string[] {
+  return (e.splitBetween?.length ?? 0) >= 1 ? e.splitBetween! : [...CORE_PEOPLE];
+}
+
+function hasCustomWeights(e: Expense): boolean {
+  return !!e.splitWeights && Object.keys(e.splitWeights).length > 0;
+}
+
+function personShare(e: Expense, person: string): number {
+  const split = effectiveSplit(e);
+  if (!split.includes(person)) return 0;
+  if (!hasCustomWeights(e)) return e.amount / split.length;
+  const w = e.splitWeights!;
+  const totalW = split.reduce((s, p) => s + (w[p] ?? 1), 0);
+  if (totalW === 0) return e.amount / split.length;
+  return e.amount * ((w[person] ?? 1) / totalW);
+}
+
+type SettlementRow = { debtor: string; creditor: string; amount: number };
+
+function computeSettlementData(net: Record<string, number>): SettlementRow[] {
+  const bal = Object.entries(net)
+    .map(([name, b]) => ({ name, b }))
+    .sort((a, c) => c.b - a.b);
+
+  const rows: SettlementRow[] = [];
+  let hi = 0, lo = bal.length - 1;
+
+  while (hi < lo) {
+    while (hi < lo && bal[hi].b < 0.005) hi++;
+    while (hi < lo && bal[lo].b > -0.005) lo--;
+    if (hi >= lo) break;
+    const amount = Math.min(bal[hi].b, -bal[lo].b);
+    if (amount > 0.005) {
+      rows.push({ debtor: bal[lo].name, creditor: bal[hi].name, amount });
+      bal[hi].b -= amount;
+      bal[lo].b += amount;
+    }
+    if (bal[hi].b < 0.005) hi++;
+    if (bal[lo].b > -0.005) lo--;
+  }
+  return rows;
+}
 
 function buildCalendar(anchor: string) {
   const focus = anchor ? new Date(anchor + "T12:00:00") : new Date();
@@ -105,7 +167,7 @@ function buildCalendar(anchor: string) {
   };
 }
 
-// ─── Sub-components ──────────────────────────────────────────────────────────
+// ─── Sub-components ───────────────────────────────────────────────────────────
 
 function GlassPanel({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
@@ -144,15 +206,7 @@ function PanelHeader({ eyebrow, title, badge }: { eyebrow: string; title: string
   );
 }
 
-function InputField({
-  label,
-  children,
-  className = "",
-}: {
-  label: string;
-  children: React.ReactNode;
-  className?: string;
-}) {
+function InputField({ label, children, className = "" }: { label: string; children: React.ReactNode; className?: string }) {
   return (
     <label className={`flex flex-col gap-1.5 ${className}`}>
       <span className="text-xs font-medium" style={{ color: "#94a3b8" }}>{label}</span>
@@ -172,20 +226,174 @@ const inputStyle = {
   width: "100%",
 };
 
-// ─── Main ────────────────────────────────────────────────────────────────────
+const smallInputStyle = {
+  ...inputStyle,
+  padding: "6px 10px",
+  fontSize: "0.8rem",
+  width: "72px",
+  textAlign: "right" as const,
+};
+
+// ─── Split picker ─────────────────────────────────────────────────────────────
+
+function SplitPicker({
+  allPeople,
+  splitBetween,
+  splitWeights,
+  amount,
+  onChange,
+}: {
+  allPeople: string[];
+  splitBetween: string[];
+  splitWeights: Record<string, number>;
+  amount: string;
+  onChange: (splitBetween: string[], splitWeights: Record<string, number>) => void;
+}) {
+  const [customMode, setCustomMode] = useState(Object.keys(splitWeights).length > 0);
+  const hasWeights = Object.keys(splitWeights).length > 0;
+  const amt = parseFloat(amount) || 0;
+
+  function togglePerson(person: string) {
+    const next = splitBetween.includes(person)
+      ? splitBetween.filter((p) => p !== person)
+      : [...splitBetween, person];
+    if (next.length < 1) return;
+    const nextWeights = { ...splitWeights };
+    delete nextWeights[person];
+    onChange(next, nextWeights);
+  }
+
+  function setWeight(person: string, val: string) {
+    const n = parseFloat(val);
+    onChange(splitBetween, { ...splitWeights, [person]: isNaN(n) ? 1 : Math.max(0, n) });
+  }
+
+  function toggleCustomMode() {
+    if (customMode) {
+      setCustomMode(false);
+      onChange(splitBetween, {});
+    } else {
+      const seed: Record<string, number> = {};
+      splitBetween.forEach((p) => { seed[p] = 1; });
+      setCustomMode(true);
+      onChange(splitBetween, seed);
+    }
+  }
+
+  function preview(person: string): string {
+    if (!amt) return fmt(0);
+    if (!hasWeights) return fmt(amt / splitBetween.length);
+    const totalW = splitBetween.reduce((s, p) => s + (splitWeights[p] ?? 1), 0);
+    if (totalW === 0) return fmt(0);
+    return fmt(amt * ((splitWeights[person] ?? 1) / totalW));
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium" style={{ color: "#94a3b8" }}>Split between</span>
+        <button
+          type="button"
+          onClick={toggleCustomMode}
+          className="text-xs font-medium px-2.5 py-1 rounded-lg transition-all"
+          style={
+            customMode
+              ? { background: "rgba(251,191,36,0.12)", color: "#fbbf24", border: "1px solid rgba(251,191,36,0.25)" }
+              : { background: "rgba(255,255,255,0.05)", color: "#64748b", border: "1px solid rgba(255,255,255,0.08)" }
+          }
+        >
+          {customMode ? "Custom weights" : "Equal split"}
+        </button>
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        {allPeople.map((p) => {
+          const active = splitBetween.includes(p);
+          return (
+            <button
+              key={p}
+              type="button"
+              onClick={() => togglePerson(p)}
+              className="px-3 py-1.5 rounded-xl text-xs font-semibold transition-all"
+              style={
+                active
+                  ? { background: "rgba(34,211,238,0.15)", color: "#22d3ee", border: "1px solid rgba(34,211,238,0.35)" }
+                  : { background: "rgba(255,255,255,0.04)", color: "#475569", border: "1px solid rgba(255,255,255,0.08)" }
+              }
+            >
+              {active ? "✓ " : ""}{p}
+            </button>
+          );
+        })}
+      </div>
+
+      {customMode && splitBetween.length > 0 && (
+        <div className="rounded-2xl p-3 space-y-2" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)" }}>
+          <p className="text-xs" style={{ color: "#475569" }}>Proportional weights (miles, hours, %, etc.)</p>
+          {splitBetween.map((p) => (
+            <div key={p} className="flex items-center gap-2">
+              <span className="flex-1 text-xs font-medium text-white">{p}</span>
+              <input
+                type="number" min="0" step="any"
+                value={splitWeights[p] ?? 1}
+                onChange={(ev) => setWeight(p, ev.target.value)}
+                style={smallInputStyle}
+              />
+              {amt > 0 && (
+                <span className="text-xs font-semibold w-20 text-right" style={{ color: "#22d3ee" }}>
+                  {preview(p)}
+                </span>
+              )}
+            </div>
+          ))}
+          {amt > 0 && (
+            <div className="pt-1 border-t" style={{ borderColor: "rgba(255,255,255,0.06)" }}>
+              <p className="text-xs" style={{ color: "#475569" }}>
+                {splitBetween.map((p) => `${p}: ${preview(p)}`).join("  ·  ")}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {!customMode && splitBetween.length > 1 && amt > 0 && (
+        <p className="text-xs" style={{ color: "#475569" }}>{fmt(amt / splitBetween.length)} each</p>
+      )}
+    </div>
+  );
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 export default function Home() {
+  const todayIso = new Date().toISOString().split("T")[0];
+
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [rental, setRental] = useState<RentalInfo>(initialRental);
-  const todayIso = new Date().toISOString().split("T")[0];
-  const [form, setForm] = useState({ title: "", amount: "", paidBy: "Eduardo" as Person, category: "Monthly rent", note: "", date: todayIso });
-  const [filter, setFilter] = useState<"All" | Person>("All");
+
+  const blankForm = () => ({
+    title: "", amount: "", paidBy: "Eduardo", category: "Monthly rent",
+    note: "", date: todayIso,
+    splitBetween: [...CORE_PEOPLE],
+    splitWeights: {} as Record<string, number>,
+    dueNow: undefined as boolean | undefined,
+  });
+
+  const [form, setForm] = useState(blankForm);
+  const [filter, setFilter] = useState<string>("All");
   const [activeTab, setActiveTab] = useState<"expenses" | "rental" | "calendar">("expenses");
   const [syncLabel, setSyncLabel] = useState(isFirebaseConfigured ? "Connecting…" : "Local mode");
   const [isAdding, setIsAdding] = useState(false);
+  const [isLoggingPayment, setIsLoggingPayment] = useState(false);
+  const [paymentForm, setPaymentForm] = useState({ from: "Martha", to: "Eduardo", amount: "", date: todayIso, note: "" });
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editForm, setEditForm] = useState({ title: "", amount: "", paidBy: "Eduardo" as Person, category: "Monthly rent", note: "", date: todayIso });
+  const [editForm, setEditForm] = useState(blankForm);
   const [calendarAnchor, setCalendarAnchor] = useState(() => new Date().toISOString().split("T")[0]);
+
+  const allPeople = useMemo(
+    () => [...CORE_PEOPLE, ...(rental.thirdPerson.trim() ? [rental.thirdPerson.trim()] : [])],
+    [rental.thirdPerson]
+  );
 
   // Firebase / localStorage sync
   useEffect(() => {
@@ -193,12 +401,9 @@ export default function Home() {
       const dbRef = ref(database, DASHBOARD_REF);
       return onValue(dbRef, (snap) => {
         const val = snap.val() as DashboardPayload | null;
-        if (!val) {
-          setSyncLabel("Synced");
-          return;
-        }
+        if (!val) { setSyncLabel("Synced"); return; }
         if (val.expenses) setExpenses(val.expenses);
-        if (val.rentalInfo) setRental(val.rentalInfo);
+        if (val.rentalInfo) setRental({ ...initialRental(), ...val.rentalInfo });
         setSyncLabel("Synced");
       });
     }
@@ -207,7 +412,7 @@ export default function Home() {
     try {
       const p = JSON.parse(raw) as DashboardPayload;
       if (p.expenses?.length) setExpenses(p.expenses);
-      if (p.rentalInfo) setRental(p.rentalInfo);
+      if (p.rentalInfo) setRental({ ...initialRental(), ...p.rentalInfo });
       setSyncLabel("Saved locally");
     } catch {
       window.localStorage.removeItem(STORAGE_KEY);
@@ -215,10 +420,12 @@ export default function Home() {
   }, []);
 
   async function persist(nextExpenses: Expense[], nextRental: RentalInfo) {
+    // JSON round-trip strips undefined values that Firebase rejects
+    const payload = JSON.parse(JSON.stringify({ expenses: nextExpenses, rentalInfo: nextRental }));
     if (database) {
-      await set(ref(database, DASHBOARD_REF), { expenses: nextExpenses, rentalInfo: nextRental });
+      await set(ref(database, DASHBOARD_REF), payload);
     } else {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ expenses: nextExpenses, rentalInfo: nextRental }));
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
       setExpenses(nextExpenses);
       setRental(nextRental);
     }
@@ -226,19 +433,71 @@ export default function Home() {
 
   // Computed
   const summary = useMemo(() => {
-    const total = expenses.reduce((s, e) => s + e.amount, 0);
-    const paid: Record<Person, number> = { Eduardo: 0, Martha: 0 };
-    expenses.forEach((e) => { paid[e.paidBy] += e.amount; });
-    const share = total / 2;
-    const balE = paid.Eduardo - share;
-    return { total, count: expenses.length, share, paid, balE };
-  }, [expenses]);
+    function dueNow(e: Expense) {
+      return e.dueNow !== undefined ? e.dueNow : e.createdAt <= todayIso;
+    }
 
-  const balanceText = summary.balE > 0.005
-    ? `Martha owes Eduardo ${fmt(summary.balE)}`
-    : summary.balE < -0.005
-    ? `Eduardo owes Martha ${fmt(Math.abs(summary.balE))}`
-    : "Even split";
+    const dueExpenses = expenses.filter(dueNow);
+    const upcomingExpenses = expenses.filter((e) => !dueNow(e));
+    const totalAll = expenses.filter((e) => !e.isPayment).reduce((s, e) => s + e.amount, 0);
+    const totalUpcoming = upcomingExpenses.filter((e) => !e.isPayment).reduce((s, e) => s + e.amount, 0);
+
+    // Net from due expenses only (= total owed before any payments)
+    const netExpenses: Record<string, number> = Object.fromEntries(allPeople.map((p) => [p, 0]));
+    for (const e of dueExpenses.filter((e) => !e.isPayment)) {
+      netExpenses[e.paidBy] = (netExpenses[e.paidBy] ?? 0) + e.amount;
+      for (const p of effectiveSplit(e)) {
+        netExpenses[p] = (netExpenses[p] ?? 0) - personShare(e, p);
+      }
+    }
+
+    // Net including payments (= remaining balance)
+    const netAll: Record<string, number> = { ...netExpenses };
+    for (const e of dueExpenses.filter((e) => e.isPayment)) {
+      netAll[e.paidBy] = (netAll[e.paidBy] ?? 0) + e.amount;
+      for (const p of effectiveSplit(e)) {
+        netAll[p] = (netAll[p] ?? 0) - personShare(e, p);
+      }
+    }
+
+    // Build settlement pairs: total owed → remaining after payments
+    const rawRows = computeSettlementData(netExpenses);
+    const remainingRows = computeSettlementData(netAll);
+    const settlementPairs = rawRows.map((r) => {
+      const rem = remainingRows.find((x) => x.debtor === r.debtor && x.creditor === r.creditor);
+      return { debtor: r.debtor, creditor: r.creditor, total: r.amount, remaining: rem?.amount ?? 0 };
+    });
+
+    const paid: Record<string, number> = Object.fromEntries(allPeople.map((p) => [p, 0]));
+    for (const e of expenses) {
+      if (!e.isPayment) paid[e.paidBy] = (paid[e.paidBy] ?? 0) + e.amount;
+    }
+
+    const nearestUpcoming = [...upcomingExpenses]
+      .filter((e) => !e.isPayment)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+
+    return {
+      totalAll, totalUpcoming,
+      count: expenses.filter((e) => !e.isPayment).length,
+      upcomingCount: upcomingExpenses.filter((e) => !e.isPayment).length,
+      paid, settlementPairs, nearestUpcoming,
+    };
+  }, [expenses, allPeople, todayIso]);
+
+  // Upcoming hero card label + value
+  const upcomingCard = useMemo(() => {
+    if (summary.upcomingCount === 0) {
+      return { label: "Expenses", value: `${summary.count} item${summary.count !== 1 ? "s" : ""}` };
+    }
+    if (summary.upcomingCount === 1 && summary.nearestUpcoming) {
+      return { label: `Due ${shortDate(summary.nearestUpcoming.createdAt)}`, value: fmt(summary.nearestUpcoming.amount) };
+    }
+    return {
+      label: "Upcoming",
+      value: `${fmt(summary.totalUpcoming)} · next ${shortDate(summary.nearestUpcoming!.createdAt)}`,
+    };
+  }, [summary]);
 
   const filtered = filter === "All" ? expenses : expenses.filter((e) => e.paidBy === filter);
 
@@ -248,21 +507,18 @@ export default function Home() {
     { key: "out", label: "Move out", value: rental.plannedMoveOutDate, color: "#f87171" },
   ].filter((d) => d.value), [rental]);
 
-  // All 1st-of-month billing dates between chargeStartDate and plannedMoveOutDate
   const billingDates = useMemo(() => {
     if (!rental.chargeStartDate) return [];
     const start = new Date(rental.chargeStartDate + "T12:00:00");
     const end = rental.plannedMoveOutDate ? new Date(rental.plannedMoveOutDate + "T12:00:00") : null;
     const dates: string[] = [];
-    // Start from the 1st of the month after (or on) chargeStartDate
-    let y = start.getFullYear();
-    let m = start.getMonth();
+    let y = start.getFullYear(), m = start.getMonth();
     if (start.getDate() > 1) m += 1;
     while (true) {
       if (m > 11) { y += 1; m = 0; }
       const d = new Date(y, m, 1);
       if (end && d > end) break;
-      if (!end && dates.length >= 24) break; // safety cap
+      if (!end && dates.length >= 24) break;
       dates.push(d.toISOString().split("T")[0]);
       m += 1;
     }
@@ -275,6 +531,10 @@ export default function Home() {
     e.preventDefault();
     const amt = parseFloat(form.amount);
     if (!form.title.trim() || isNaN(amt) || amt === 0) return;
+    const date = form.date || todayIso;
+    const isFuture = date > todayIso;
+    const split = form.splitBetween.length >= 2 ? form.splitBetween : [...CORE_PEOPLE];
+    const weights = Object.keys(form.splitWeights).length > 0 ? form.splitWeights : undefined;
     const next: Expense = {
       id: crypto.randomUUID(),
       title: form.title.trim(),
@@ -282,19 +542,55 @@ export default function Home() {
       paidBy: form.paidBy,
       category: form.category || "Misc",
       note: form.note.trim(),
-      createdAt: form.date || todayIso,
+      createdAt: date,
+      splitBetween: split,
+      ...(weights ? { splitWeights: weights } : {}),
+      ...(isFuture && form.dueNow !== undefined ? { dueNow: form.dueNow } : {}),
     };
     const nextList = [next, ...expenses].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     setExpenses(nextList);
     await persist(nextList, rental);
-    setForm({ title: "", amount: "", paidBy: "Eduardo", category: "Monthly rent", note: "", date: todayIso });
+    setForm(blankForm());
     setIsAdding(false);
+  }
+
+  async function handleLogPayment(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const amt = parseFloat(paymentForm.amount);
+    if (isNaN(amt) || amt <= 0 || paymentForm.from === paymentForm.to) return;
+    const next: Expense = {
+      id: crypto.randomUUID(),
+      title: `${paymentForm.from} → ${paymentForm.to}`,
+      amount: amt,
+      paidBy: paymentForm.from,
+      category: "Payment",
+      note: paymentForm.note.trim(),
+      createdAt: paymentForm.date || todayIso,
+      splitBetween: [paymentForm.to],
+      isPayment: true,
+    };
+    const nextList = [next, ...expenses].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    setExpenses(nextList);
+    await persist(nextList, rental);
+    setPaymentForm({ from: "Martha", to: "Eduardo", amount: "", date: todayIso, note: "" });
+    setIsLoggingPayment(false);
   }
 
   function startEdit(e: Expense) {
     setEditingId(e.id);
-    setEditForm({ title: e.title, amount: String(e.amount), paidBy: e.paidBy, category: e.category, note: e.note, date: e.createdAt });
+    setEditForm({
+      title: e.title,
+      amount: String(e.amount),
+      paidBy: e.paidBy,
+      category: e.category,
+      note: e.note,
+      date: e.createdAt,
+      splitBetween: effectiveSplit(e),
+      splitWeights: e.splitWeights ?? {},
+      dueNow: e.dueNow,
+    });
     setIsAdding(false);
+    setIsLoggingPayment(false);
   }
 
   async function handleSaveEdit(ev: FormEvent<HTMLFormElement>) {
@@ -302,8 +598,27 @@ export default function Home() {
     if (!editingId) return;
     const amt = parseFloat(editForm.amount);
     if (!editForm.title.trim() || isNaN(amt) || amt === 0) return;
+    const date = editForm.date || todayIso;
+    const isFuture = date > todayIso;
+    const split = editForm.splitBetween.length >= 2 ? editForm.splitBetween : [...CORE_PEOPLE];
+    const weights = Object.keys(editForm.splitWeights).length > 0 ? editForm.splitWeights : undefined;
     const nextList = expenses
-      .map((e) => e.id === editingId ? { ...e, title: editForm.title.trim(), amount: amt, paidBy: editForm.paidBy, category: editForm.category, note: editForm.note.trim(), createdAt: editForm.date || todayIso } : e)
+      .map((e) =>
+        e.id === editingId
+          ? {
+              ...e,
+              title: editForm.title.trim(),
+              amount: amt,
+              paidBy: editForm.paidBy,
+              category: editForm.category,
+              note: editForm.note.trim(),
+              createdAt: date,
+              splitBetween: split,
+              splitWeights: weights,
+              dueNow: isFuture ? editForm.dueNow : undefined,
+            }
+          : e
+      )
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     setExpenses(nextList);
     await persist(nextList, rental);
@@ -335,79 +650,115 @@ export default function Home() {
   return (
     <PasscodeGate>
       <div className="min-h-screen" style={{ background: "linear-gradient(135deg, #080e18 0%, #0c1622 50%, #080e18 100%)" }}>
-        {/* ── Header ── */}
+        {/* Header */}
         <header className="sticky top-0 z-50 px-4 pt-safe-top" style={{ background: "rgba(8,14,24,0.85)", backdropFilter: "blur(20px)", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
           <div className="mx-auto max-w-2xl flex items-center justify-between py-4">
             <div>
               <p className="text-xs font-semibold tracking-widest uppercase" style={{ color: "#22d3ee" }}>Summer 2026</p>
               <h1 className="text-base font-bold text-white leading-tight">Manhattan Mini Storage</h1>
             </div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs px-2.5 py-1 rounded-full font-medium" style={{ background: "rgba(34,211,238,0.1)", color: "#22d3ee", border: "1px solid rgba(34,211,238,0.2)" }}>
-                {syncLabel}
-              </span>
-            </div>
+            <span className="text-xs px-2.5 py-1 rounded-full font-medium" style={{ background: "rgba(34,211,238,0.1)", color: "#22d3ee", border: "1px solid rgba(34,211,238,0.2)" }}>
+              {syncLabel}
+            </span>
           </div>
         </header>
 
         <div className="mx-auto max-w-2xl px-4 pb-24">
-          {/* ── Hero metrics ── */}
-          <div className="mt-5 grid grid-cols-3 gap-3">
-            {[
-              { label: "Total spend", value: fmt(summary.total), gradient: "from-cyan-400 to-indigo-400" },
-              { label: "Per person", value: fmt(summary.share), gradient: "from-emerald-400 to-cyan-400" },
-              { label: "Entries", value: String(summary.count), gradient: "from-violet-400 to-pink-400" },
-            ].map((m) => (
-              <GlassPanel key={m.label} className="p-4 text-center">
-                <p className="text-xs mb-1" style={{ color: "#64748b" }}>{m.label}</p>
-                <p className={`text-base font-bold bg-gradient-to-r ${m.gradient} bg-clip-text text-transparent`}>{m.value}</p>
-              </GlassPanel>
-            ))}
+          {/* Hero metrics — 2 cards */}
+          <div className="mt-5 grid grid-cols-2 gap-3">
+            <GlassPanel className="p-4 text-center">
+              <p className="text-xs mb-1" style={{ color: "#64748b" }}>Total spend</p>
+              <p className="text-base font-bold bg-gradient-to-r from-cyan-400 to-indigo-400 bg-clip-text text-transparent">{fmt(summary.totalAll)}</p>
+            </GlassPanel>
+            <GlassPanel className="p-4 text-center">
+              <p className="text-xs mb-1" style={{ color: "#64748b" }}>{upcomingCard.label}</p>
+              <p className="text-base font-bold bg-gradient-to-r from-violet-400 to-pink-400 bg-clip-text text-transparent">{upcomingCard.value}</p>
+            </GlassPanel>
           </div>
 
-          {/* ── Balance banner ── */}
-          <div className="mt-3 rounded-2xl px-4 py-3 flex items-center gap-3" style={{ background: "rgba(34,211,238,0.08)", border: "1px solid rgba(34,211,238,0.15)" }}>
-            <div className="h-2 w-2 rounded-full shrink-0" style={{ background: "#22d3ee", boxShadow: "0 0 8px #22d3ee" }} />
-            <p className="text-sm font-medium" style={{ color: "#e2e8f0" }}>{balanceText}</p>
-          </div>
+          {/* Balance tracker */}
+          {summary.settlementPairs.filter((p) => p.remaining >= 0.005).length === 0 ? (
+            <div className="mt-3 rounded-2xl px-4 py-3 flex items-center gap-3" style={{ background: "rgba(52,211,153,0.08)", border: "1px solid rgba(52,211,153,0.18)" }}>
+              <div className="h-2 w-2 rounded-full shrink-0" style={{ background: "#34d399", boxShadow: "0 0 8px #34d399" }} />
+              <p className="text-sm font-medium" style={{ color: "#34d399" }}>All settled</p>
+            </div>
+          ) : (
+            summary.settlementPairs.filter((p) => p.remaining >= 0.005).map(({ debtor, creditor, total, remaining }) => {
+              const paid = total - remaining;
+              const pct = total > 0 ? Math.min(100, (paid / total) * 100) : 0;
+              const isSettled = remaining < 0.005;
+              return (
+                <div key={`${debtor}-${creditor}`} className="mt-3 rounded-2xl px-4 py-3" style={{ background: "rgba(34,211,238,0.08)", border: "1px solid rgba(34,211,238,0.15)" }}>
+                  <p className="text-xs font-semibold tracking-wide mb-2.5" style={{ color: "#22d3ee" }}>
+                    {debtor} → {creditor}
+                  </p>
+                  <div className="flex items-end justify-between gap-4">
+                    <div>
+                      <p className="text-xs mb-0.5" style={{ color: "#64748b" }}>Total share</p>
+                      <p className="text-sm font-bold text-white">{fmt(total)}</p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-xs mb-0.5" style={{ color: "#64748b" }}>Remaining</p>
+                      <p className="text-sm font-bold" style={{ color: "#fbbf24" }}>
+                        {fmt(remaining)}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="mt-2.5 h-1.5 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.06)" }}>
+                    <div
+                      className="h-full rounded-full transition-all duration-500"
+                      style={{
+                        width: `${pct}%`,
+                        background: isSettled ? "#34d399" : "linear-gradient(90deg,#34d399,#22d3ee)",
+                      }}
+                    />
+                  </div>
+                  {paid > 0.005 && (
+                    <p className="text-xs mt-1" style={{ color: "#475569" }}>{fmt(paid)} paid</p>
+                  )}
+                </div>
+              );
+            })
+          )}
+          {summary.totalUpcoming > 0 && (
+            <div className="mt-2 rounded-xl px-3 py-2" style={{ background: "rgba(251,191,36,0.07)", border: "1px solid rgba(251,191,36,0.15)" }}>
+              <p className="text-xs" style={{ color: "#fbbf24" }}>+ {fmt(summary.totalUpcoming)} upcoming (not yet due)</p>
+            </div>
+          )}
 
-          {/* ── Person bar chart ── */}
+          {/* Bar chart */}
           <GlassPanel className="mt-3 p-4">
             <div className="flex items-center justify-between mb-3">
-              {PEOPLE.map((p) => (
+              {allPeople.map((p) => (
                 <div key={p} className="flex-1 text-center">
                   <p className="text-xs font-medium mb-0.5" style={{ color: "#94a3b8" }}>{p}</p>
-                  <p className="text-lg font-bold text-white">{fmt(summary.paid[p])}</p>
+                  <p className="text-lg font-bold text-white">{fmt(summary.paid[p] ?? 0)}</p>
                 </div>
               ))}
             </div>
             <div className="flex gap-1.5 h-2 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.06)" }}>
-              {summary.total > 0 && (
-                <>
-                  <div
-                    className="h-full rounded-full transition-all"
-                    style={{ width: `${(summary.paid.Eduardo / summary.total) * 100}%`, background: "linear-gradient(90deg, #f472b6, #fb923c)" }}
-                  />
-                  <div
-                    className="h-full rounded-full transition-all"
-                    style={{ width: `${(summary.paid.Martha / summary.total) * 100}%`, background: "linear-gradient(90deg, #22d3ee, #818cf8)" }}
-                  />
-                </>
-              )}
+              {summary.totalAll > 0 && allPeople.map((p) => {
+                const pal = paletteFor(p, allPeople);
+                const pct = ((summary.paid[p] ?? 0) / summary.totalAll) * 100;
+                return pct > 0 ? (
+                  <div key={p} className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: pal.gradient }} />
+                ) : null;
+              })}
             </div>
-            <div className="mt-2 flex justify-between text-xs" style={{ color: "#475569" }}>
-              <span className="flex items-center gap-1.5">
-                <span className="h-1.5 w-3 rounded-full inline-block" style={{ background: "linear-gradient(90deg, #f472b6, #fb923c)" }} />
-                Eduardo
-              </span>
-              <span className="flex items-center gap-1.5">
-                Martha
-                <span className="h-1.5 w-3 rounded-full inline-block" style={{ background: "linear-gradient(90deg, #22d3ee, #818cf8)" }} />
-              </span>
+            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+              {allPeople.map((p) => {
+                const pal = paletteFor(p, allPeople);
+                return (
+                  <span key={p} className="flex items-center gap-1.5 text-xs" style={{ color: "#475569" }}>
+                    <span className="h-1.5 w-3 rounded-full inline-block" style={{ background: pal.gradient }} />
+                    {p}
+                  </span>
+                );
+              })}
             </div>
           </GlassPanel>
 
-          {/* ── Tab bar ── */}
+          {/* Tab bar */}
           <div className="mt-5 flex gap-2 p-1 rounded-2xl" style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)" }}>
             {(["expenses", "rental", "calendar"] as const).map((tab) => (
               <button
@@ -428,20 +779,36 @@ export default function Home() {
           {/* ── COSTS TAB ── */}
           {activeTab === "expenses" && (
             <div className="mt-4 space-y-3">
-              {/* Add button / inline form */}
-              {!isAdding ? (
-                <button
-                  type="button"
-                  onClick={() => setIsAdding(true)}
-                  className="w-full py-3.5 rounded-2xl text-sm font-semibold transition-all hover:opacity-90 active:scale-95 flex items-center justify-center gap-2"
-                  style={{ background: "linear-gradient(135deg, #22d3ee, #818cf8)", color: "white" }}
-                >
-                  <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                  </svg>
-                  Add expense
-                </button>
-              ) : (
+              {/* Action buttons */}
+              {!isAdding && !isLoggingPayment && !editingId && (
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsAdding(true)}
+                    className="flex-1 py-3.5 rounded-2xl text-sm font-semibold transition-all hover:opacity-90 active:scale-95 flex items-center justify-center gap-2"
+                    style={{ background: "linear-gradient(135deg, #22d3ee, #818cf8)", color: "white" }}
+                  >
+                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                    </svg>
+                    Add expense
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsLoggingPayment(true)}
+                    className="py-3.5 px-4 rounded-2xl text-sm font-semibold transition-all hover:opacity-90 active:scale-95 flex items-center justify-center gap-2"
+                    style={{ background: "rgba(52,211,153,0.12)", color: "#34d399", border: "1px solid rgba(52,211,153,0.2)" }}
+                  >
+                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                    </svg>
+                    Payment
+                  </button>
+                </div>
+              )}
+
+              {/* Add expense form */}
+              {isAdding && (
                 <GlassPanel className="p-5">
                   <PanelHeader eyebrow="Add expense" title="Log a new charge" />
                   <form onSubmit={handleAddExpense} className="space-y-3">
@@ -458,67 +825,60 @@ export default function Home() {
                     <div className="grid grid-cols-2 gap-3">
                       <InputField label="Amount (negative = refund)">
                         <input
-                          type="number"
-                          inputMode="decimal"
-                          step="0.01"
-                          placeholder="0.00"
+                          type="number" inputMode="decimal" step="0.01" placeholder="0.00"
                           value={form.amount}
                           onChange={(e) => setForm((f) => ({ ...f, amount: e.target.value }))}
                           style={inputStyle}
                         />
                       </InputField>
                       <InputField label="Who paid?">
-                        <select
-                          value={form.paidBy}
-                          onChange={(e) => setForm((f) => ({ ...f, paidBy: e.target.value as Person }))}
-                          style={inputStyle}
-                        >
-                          {PEOPLE.map((p) => <option key={p} value={p}>{p}</option>)}
+                        <select value={form.paidBy} onChange={(e) => setForm((f) => ({ ...f, paidBy: e.target.value }))} style={inputStyle}>
+                          {allPeople.map((p) => <option key={p} value={p}>{p}</option>)}
                         </select>
                       </InputField>
                     </div>
                     <div className="grid grid-cols-2 gap-3">
                       <InputField label="Date">
-                        <input
-                          type="date"
-                          value={form.date}
-                          onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))}
-                          style={{ ...inputStyle, colorScheme: "dark" }}
-                        />
+                        <input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value, dueNow: undefined }))} style={{ ...inputStyle, colorScheme: "dark" }} />
                       </InputField>
                       <InputField label="Category">
-                        <select
-                          value={form.category}
-                          onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))}
-                          style={inputStyle}
-                        >
+                        <select value={form.category} onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))} style={inputStyle}>
                           {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
                         </select>
                       </InputField>
                     </div>
+                    <SplitPicker
+                      allPeople={allPeople}
+                      splitBetween={form.splitBetween}
+                      splitWeights={form.splitWeights}
+                      amount={form.amount}
+                      onChange={(sb, sw) => setForm((f) => ({ ...f, splitBetween: sb, splitWeights: sw }))}
+                    />
+                    {form.date > todayIso && (
+                      <div className="flex flex-col gap-1.5">
+                        <span className="text-xs font-medium" style={{ color: "#94a3b8" }}>Due status</span>
+                        <button
+                          type="button"
+                          onClick={() => setForm((f) => ({ ...f, dueNow: f.dueNow === true ? undefined : true }))}
+                          className="self-start px-3 py-1.5 rounded-xl text-xs font-semibold transition-all"
+                          style={
+                            form.dueNow === true
+                              ? { background: "rgba(52,211,153,0.15)", color: "#34d399", border: "1px solid rgba(52,211,153,0.35)" }
+                              : { background: "rgba(251,191,36,0.1)", color: "#fbbf24", border: "1px solid rgba(251,191,36,0.25)" }
+                          }
+                        >
+                          {form.dueNow === true ? "✓ Due now" : `Not due until ${shortDate(form.date)}`}
+                        </button>
+                      </div>
+                    )}
                     <InputField label="Note (optional)">
-                      <input
-                        type="text"
-                        placeholder="Any detail…"
-                        value={form.note}
-                        onChange={(e) => setForm((f) => ({ ...f, note: e.target.value }))}
-                        style={inputStyle}
-                      />
+                      <input type="text" placeholder="Any detail…" value={form.note} onChange={(e) => setForm((f) => ({ ...f, note: e.target.value }))} style={inputStyle} />
                     </InputField>
                     <div className="flex gap-2 pt-1">
-                      <button
-                        type="button"
-                        onClick={() => setIsAdding(false)}
-                        className="flex-1 py-3 rounded-xl text-sm font-medium transition-all"
-                        style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8", border: "1px solid rgba(255,255,255,0.08)" }}
-                      >
+                      <button type="button" onClick={() => setIsAdding(false)} className="flex-1 py-3 rounded-xl text-sm font-medium transition-all" style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8", border: "1px solid rgba(255,255,255,0.08)" }}>
                         Cancel
                       </button>
-                      <button
-                        type="submit"
-                        className="flex-2 flex-1 py-3 rounded-xl text-sm font-semibold transition-all hover:opacity-90"
-                        style={{ background: "linear-gradient(135deg, #22d3ee, #818cf8)", color: "white" }}
-                      >
+                      <button type="submit" className="flex-1 py-3 rounded-xl text-sm font-semibold transition-all hover:opacity-90" style={{ background: "linear-gradient(135deg, #22d3ee, #818cf8)", color: "white" }}>
                         Save
                       </button>
                     </div>
@@ -526,13 +886,60 @@ export default function Home() {
                 </GlassPanel>
               )}
 
+              {/* Log payment form */}
+              {isLoggingPayment && (
+                <GlassPanel className="p-5">
+                  <PanelHeader eyebrow="Payment received" title="Record a settlement" />
+                  <form onSubmit={handleLogPayment} className="space-y-3">
+                    <div className="grid grid-cols-2 gap-3">
+                      <InputField label="From (sent money)">
+                        <select
+                          value={paymentForm.from}
+                          onChange={(e) => setPaymentForm((f) => ({ ...f, from: e.target.value, to: e.target.value === f.to ? allPeople.find(p => p !== e.target.value) ?? f.to : f.to }))}
+                          style={inputStyle}
+                        >
+                          {allPeople.map((p) => <option key={p} value={p}>{p}</option>)}
+                        </select>
+                      </InputField>
+                      <InputField label="To (received money)">
+                        <select
+                          value={paymentForm.to}
+                          onChange={(e) => setPaymentForm((f) => ({ ...f, to: e.target.value }))}
+                          style={inputStyle}
+                        >
+                          {allPeople.filter((p) => p !== paymentForm.from).map((p) => <option key={p} value={p}>{p}</option>)}
+                        </select>
+                      </InputField>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <InputField label="Amount">
+                        <input type="number" inputMode="decimal" step="0.01" placeholder="0.00" value={paymentForm.amount} onChange={(e) => setPaymentForm((f) => ({ ...f, amount: e.target.value }))} style={inputStyle} autoFocus />
+                      </InputField>
+                      <InputField label="Date">
+                        <input type="date" value={paymentForm.date} onChange={(e) => setPaymentForm((f) => ({ ...f, date: e.target.value }))} style={{ ...inputStyle, colorScheme: "dark" }} />
+                      </InputField>
+                    </div>
+                    <InputField label="Note (optional)">
+                      <input type="text" placeholder="Venmo, cash, etc." value={paymentForm.note} onChange={(e) => setPaymentForm((f) => ({ ...f, note: e.target.value }))} style={inputStyle} />
+                    </InputField>
+                    <div className="flex gap-2 pt-1">
+                      <button type="button" onClick={() => setIsLoggingPayment(false)} className="flex-1 py-3 rounded-xl text-sm font-medium transition-all" style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8", border: "1px solid rgba(255,255,255,0.08)" }}>
+                        Cancel
+                      </button>
+                      <button type="submit" className="flex-1 py-3 rounded-xl text-sm font-semibold transition-all hover:opacity-90" style={{ background: "linear-gradient(135deg, #34d399, #22d3ee)", color: "white" }}>
+                        Record
+                      </button>
+                    </div>
+                  </form>
+                </GlassPanel>
+              )}
+
               {/* Filter chips */}
-              <div className="flex gap-2">
-                {(["All", ...PEOPLE] as const).map((p) => (
+              <div className="flex flex-wrap gap-2">
+                {(["All", ...allPeople] as string[]).map((p) => (
                   <button
-                    key={p}
-                    type="button"
-                    onClick={() => setFilter(p as "All" | Person)}
+                    key={p} type="button"
+                    onClick={() => setFilter(p)}
                     className="px-4 py-1.5 rounded-full text-xs font-medium transition-all"
                     style={filter === p
                       ? { background: "rgba(34,211,238,0.15)", color: "#22d3ee", border: "1px solid rgba(34,211,238,0.3)" }
@@ -554,9 +961,16 @@ export default function Home() {
               ) : (
                 <div className="space-y-2">
                   {filtered.map((e) => {
-                    const isEd = e.paidBy === "Eduardo";
                     const isRefund = e.amount < 0;
+                    const isPayment = !!e.isPayment;
+                    const pal = paletteFor(e.paidBy, allPeople);
                     const isEditing = editingId === e.id;
+                    const dueNow = isExpenseDueNow(e, todayIso);
+                    const isFuture = e.createdAt > todayIso;
+                    const split = effectiveSplit(e);
+                    const weighted = hasCustomWeights(e);
+                    const isDefaultSplit = !weighted && split.length === CORE_PEOPLE.length && CORE_PEOPLE.every((p) => split.includes(p));
+                    const showSplitInfo = !isPayment && (!isDefaultSplit || weighted);
 
                     if (isEditing) {
                       return (
@@ -567,18 +981,18 @@ export default function Home() {
                               <input type="text" value={editForm.title} onChange={(ev) => setEditForm((f) => ({ ...f, title: ev.target.value }))} style={inputStyle} autoFocus />
                             </InputField>
                             <div className="grid grid-cols-2 gap-3">
-                              <InputField label="Amount (negative = refund)">
+                              <InputField label="Amount">
                                 <input type="number" inputMode="decimal" step="0.01" value={editForm.amount} onChange={(ev) => setEditForm((f) => ({ ...f, amount: ev.target.value }))} style={inputStyle} />
                               </InputField>
                               <InputField label="Who paid?">
-                                <select value={editForm.paidBy} onChange={(ev) => setEditForm((f) => ({ ...f, paidBy: ev.target.value as Person }))} style={inputStyle}>
-                                  {PEOPLE.map((p) => <option key={p} value={p}>{p}</option>)}
+                                <select value={editForm.paidBy} onChange={(ev) => setEditForm((f) => ({ ...f, paidBy: ev.target.value }))} style={inputStyle}>
+                                  {allPeople.map((p) => <option key={p} value={p}>{p}</option>)}
                                 </select>
                               </InputField>
                             </div>
                             <div className="grid grid-cols-2 gap-3">
                               <InputField label="Date">
-                                <input type="date" value={editForm.date} onChange={(ev) => setEditForm((f) => ({ ...f, date: ev.target.value }))} style={{ ...inputStyle, colorScheme: "dark" }} />
+                                <input type="date" value={editForm.date} onChange={(ev) => setEditForm((f) => ({ ...f, date: ev.target.value, dueNow: undefined }))} style={{ ...inputStyle, colorScheme: "dark" }} />
                               </InputField>
                               <InputField label="Category">
                                 <select value={editForm.category} onChange={(ev) => setEditForm((f) => ({ ...f, category: ev.target.value }))} style={inputStyle}>
@@ -586,6 +1000,32 @@ export default function Home() {
                                 </select>
                               </InputField>
                             </div>
+                            {!e.isPayment && (
+                              <SplitPicker
+                                allPeople={allPeople}
+                                splitBetween={editForm.splitBetween}
+                                splitWeights={editForm.splitWeights}
+                                amount={editForm.amount}
+                                onChange={(sb, sw) => setEditForm((f) => ({ ...f, splitBetween: sb, splitWeights: sw }))}
+                              />
+                            )}
+                            {editForm.date > todayIso && !e.isPayment && (
+                              <div className="flex flex-col gap-1.5">
+                                <span className="text-xs font-medium" style={{ color: "#94a3b8" }}>Due status</span>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditForm((f) => ({ ...f, dueNow: f.dueNow === true ? undefined : true }))}
+                                  className="self-start px-3 py-1.5 rounded-xl text-xs font-semibold transition-all"
+                                  style={
+                                    editForm.dueNow === true
+                                      ? { background: "rgba(52,211,153,0.15)", color: "#34d399", border: "1px solid rgba(52,211,153,0.35)" }
+                                      : { background: "rgba(251,191,36,0.1)", color: "#fbbf24", border: "1px solid rgba(251,191,36,0.25)" }
+                                  }
+                                >
+                                  {editForm.dueNow === true ? "✓ Due now" : `Not due until ${shortDate(editForm.date)}`}
+                                </button>
+                              </div>
+                            )}
                             <InputField label="Note (optional)">
                               <input type="text" placeholder="Any detail…" value={editForm.note} onChange={(ev) => setEditForm((f) => ({ ...f, note: ev.target.value }))} style={inputStyle} />
                             </InputField>
@@ -605,28 +1045,66 @@ export default function Home() {
                       );
                     }
 
+                    // Payment card
+                    if (isPayment) {
+                      const [from, to] = [e.paidBy, effectiveSplit(e)[0] ?? ""];
+                      return (
+                        <div
+                          key={e.id}
+                          className="rounded-3xl p-4 flex items-center justify-between gap-3 cursor-pointer"
+                          style={{ background: "rgba(52,211,153,0.07)", border: "1px solid rgba(52,211,153,0.18)" }}
+                          onClick={() => startEdit(e)}
+                        >
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div className="shrink-0 h-9 w-9 rounded-xl flex items-center justify-center text-sm font-bold" style={{ background: "rgba(52,211,153,0.15)", color: "#34d399" }}>
+                              ✓
+                            </div>
+                            <div className="min-w-0">
+                              <p className="text-sm font-semibold text-white">
+                                {from} <span style={{ color: "#34d399" }}>→</span> {to}
+                              </p>
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <span className="text-xs font-semibold rounded-full px-2 py-0.5" style={{ background: "rgba(52,211,153,0.12)", color: "#34d399" }}>Payment</span>
+                                <span className="text-xs" style={{ color: "#475569" }}>{shortDate(e.createdAt)}</span>
+                                {e.note && <span className="text-xs truncate" style={{ color: "#64748b" }}>{e.note}</span>}
+                              </div>
+                            </div>
+                          </div>
+                          <p className="text-sm font-bold shrink-0" style={{ color: "#34d399" }}>{fmt(e.amount)}</p>
+                        </div>
+                      );
+                    }
+
+                    // Regular expense card
                     return (
                       <GlassPanel key={e.id} className="p-4">
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex items-start gap-3 flex-1 min-w-0" onClick={() => startEdit(e)} style={{ cursor: "pointer" }}>
                             <div
                               className="shrink-0 h-9 w-9 rounded-xl flex items-center justify-center text-xs font-bold"
-                              style={isRefund
-                                ? { background: "rgba(52,211,153,0.15)", color: "#34d399" }
-                                : isEd
-                                ? { background: "rgba(244,114,182,0.15)", color: "#f472b6" }
-                                : { background: "rgba(34,211,238,0.15)", color: "#22d3ee" }
-                              }
+                              style={isRefund ? { background: "rgba(52,211,153,0.15)", color: "#34d399" } : { background: pal.bg, color: pal.text }}
                             >
                               {isRefund ? "↩" : e.paidBy[0]}
                             </div>
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center justify-between gap-2">
-                                <div className="flex items-center gap-2 min-w-0">
+                                <div className="flex items-center gap-2 min-w-0 flex-wrap">
                                   <p className="text-sm font-semibold text-white truncate">{e.title}</p>
                                   {isRefund && (
                                     <span className="shrink-0 text-xs font-semibold rounded-full px-2 py-0.5" style={{ background: "rgba(52,211,153,0.15)", color: "#34d399" }}>
                                       Refund
+                                    </span>
+                                  )}
+                                  {isFuture && (
+                                    <span
+                                      className="shrink-0 text-xs font-semibold rounded-full px-2 py-0.5"
+                                      style={
+                                        dueNow
+                                          ? { background: "rgba(52,211,153,0.15)", color: "#34d399", border: "1px solid rgba(52,211,153,0.25)" }
+                                          : { background: "rgba(251,191,36,0.1)", color: "#fbbf24", border: "1px solid rgba(251,191,36,0.2)" }
+                                      }
+                                    >
+                                      {dueNow ? "Due now" : `Due ${shortDate(e.createdAt)}`}
                                     </span>
                                   )}
                                 </div>
@@ -634,17 +1112,29 @@ export default function Home() {
                                   {isRefund ? `−${fmt(Math.abs(e.amount))}` : fmt(e.amount)}
                                 </p>
                               </div>
-                              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5">
+                              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 items-center">
                                 <span className="text-xs" style={{ color: "#475569" }}>{e.category}</span>
-                                <span className="text-xs" style={{ color: isEd ? "#f472b6" : "#22d3ee" }}>{e.paidBy}</span>
+                                <span className="text-xs" style={{ color: pal.text }}>{e.paidBy}</span>
                                 <span className="text-xs" style={{ color: "#475569" }}>{shortDate(e.createdAt)}</span>
                               </div>
+                              {showSplitInfo && (
+                                <div className="mt-1.5">
+                                  {weighted ? (
+                                    <p className="text-xs" style={{ color: "#64748b" }}>
+                                      ÷ {split.map((p) => `${p}: ${fmt(personShare(e, p))}`).join("  ·  ")}
+                                    </p>
+                                  ) : (
+                                    <span className="text-xs rounded-full px-1.5 py-0.5 inline-block" style={{ background: "rgba(255,255,255,0.05)", color: "#64748b", border: "1px solid rgba(255,255,255,0.07)" }}>
+                                      ÷ {split.join(" · ")}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
                               {e.note && <p className="text-xs mt-1.5 leading-relaxed" style={{ color: "#64748b" }}>{e.note}</p>}
                             </div>
                           </div>
                           <button
-                            type="button"
-                            onClick={() => startEdit(e)}
+                            type="button" onClick={() => startEdit(e)}
                             className="shrink-0 h-7 w-7 rounded-lg flex items-center justify-center transition-all"
                             style={{ color: "#475569" }}
                             aria-label={`Edit ${e.title}`}
@@ -677,7 +1167,13 @@ export default function Home() {
                 </div>
 
                 <div className="h-px" style={{ background: "rgba(255,255,255,0.06)" }} />
+                <p className="text-xs font-semibold tracking-widest uppercase" style={{ color: "#22d3ee" }}>People</p>
 
+                <InputField label="3rd person (optional — unlocks split options per transaction)">
+                  <input type="text" placeholder="Name…" value={rental.thirdPerson} onChange={(e) => void updateRental("thirdPerson", e.target.value)} style={inputStyle} />
+                </InputField>
+
+                <div className="h-px" style={{ background: "rgba(255,255,255,0.06)" }} />
                 <p className="text-xs font-semibold tracking-widest uppercase" style={{ color: "#22d3ee" }}>Key Dates</p>
 
                 <div className="grid grid-cols-2 gap-3">
@@ -694,7 +1190,6 @@ export default function Home() {
 
                 <div className="h-px" style={{ background: "rgba(255,255,255,0.06)" }} />
 
-                {/* Date pill summary */}
                 <div className="grid grid-cols-2 gap-2">
                   {importantDates.map((d) => (
                     <div key={d.key} className="rounded-2xl px-4 py-3" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
@@ -715,45 +1210,24 @@ export default function Home() {
           {activeTab === "calendar" && (
             <div className="mt-4 space-y-3">
               <GlassPanel className="p-5">
-                {/* Month nav */}
                 <div className="flex items-center justify-between mb-5">
                   <div>
                     <p className="text-xs font-semibold tracking-widest uppercase mb-0.5" style={{ color: "#22d3ee" }}>Calendar</p>
                     <h2 className="text-lg font-bold text-white">{calendar.label}</h2>
                   </div>
                   <div className="flex gap-1">
-                    <button
-                      type="button"
-                      onClick={() => stepMonth(-1)}
-                      className="h-9 w-9 rounded-xl flex items-center justify-center transition-all hover:opacity-80"
-                      style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8" }}
-                    >
-                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                      </svg>
+                    <button type="button" onClick={() => stepMonth(-1)} className="h-9 w-9 rounded-xl flex items-center justify-center transition-all hover:opacity-80" style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8" }}>
+                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => setCalendarAnchor(new Date().toISOString().split("T")[0])}
-                      className="px-3 h-9 rounded-xl text-xs font-medium transition-all hover:opacity-80"
-                      style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8" }}
-                    >
+                    <button type="button" onClick={() => setCalendarAnchor(new Date().toISOString().split("T")[0])} className="px-3 h-9 rounded-xl text-xs font-medium transition-all hover:opacity-80" style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8" }}>
                       Today
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => stepMonth(1)}
-                      className="h-9 w-9 rounded-xl flex items-center justify-center transition-all hover:opacity-80"
-                      style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8" }}
-                    >
-                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                      </svg>
+                    <button type="button" onClick={() => stepMonth(1)} className="h-9 w-9 rounded-xl flex items-center justify-center transition-all hover:opacity-80" style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8" }}>
+                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
                     </button>
                   </div>
                 </div>
 
-                {/* Month grid */}
                 <div className="grid grid-cols-7 gap-px rounded-2xl overflow-hidden" style={{ background: "rgba(255,255,255,0.04)" }}>
                   {["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map((d) => (
                     <div key={d} className="py-2 text-center text-xs font-semibold" style={{ color: "#475569" }}>{d}</div>
@@ -761,11 +1235,9 @@ export default function Home() {
                   {calendar.cells.map((cell) => {
                     const match = importantDates.find((d) => d.value === cell.iso);
                     const isBilling = billingDates.includes(cell.iso);
-                    const isToday = cell.iso === new Date().toISOString().split("T")[0];
+                    const isToday = cell.iso === todayIso;
                     const highlight = match ?? (isBilling ? { color: "#22d3ee", label: "Billing" } : null);
                     const dayExpenses = expenses.filter((ex) => ex.createdAt === cell.iso);
-                    const edExps = dayExpenses.filter((ex) => ex.paidBy === "Eduardo");
-                    const mExps = dayExpenses.filter((ex) => ex.paidBy === "Martha");
                     return (
                       <div
                         key={cell.iso}
@@ -775,17 +1247,10 @@ export default function Home() {
                           border: highlight ? `1px solid ${highlight.color}40` : undefined,
                         }}
                       >
-                        <span
-                          className="text-xs font-semibold"
-                          style={{
-                            color: !cell.inMonth ? "#1e293b" : highlight ? highlight.color : isToday ? "#22d3ee" : "#e2e8f0",
-                          }}
-                        >
+                        <span className="text-xs font-semibold" style={{ color: !cell.inMonth ? "#1e293b" : highlight ? highlight.color : isToday ? "#22d3ee" : "#e2e8f0" }}>
                           {cell.day}
                         </span>
-                        {isToday && !highlight && (
-                          <span className="mt-0.5 h-1 w-1 rounded-full" style={{ background: "#22d3ee" }} />
-                        )}
+                        {isToday && !highlight && <span className="mt-0.5 h-1 w-1 rounded-full" style={{ background: "#22d3ee" }} />}
                         {highlight && (
                           <span className="mt-0.5 text-center leading-tight" style={{ color: highlight.color, fontSize: "0.55rem", fontWeight: 700 }}>
                             {highlight.label.split(" ")[0]}
@@ -793,12 +1258,11 @@ export default function Home() {
                         )}
                         {dayExpenses.length > 0 && cell.inMonth && (
                           <div className="mt-auto pt-1 flex gap-0.5 justify-center flex-wrap">
-                            {edExps.map((ex) => (
-                              <span key={ex.id} className="h-1.5 w-1.5 rounded-full" style={{ background: ex.amount < 0 ? "#34d399" : "#f472b6" }} />
-                            ))}
-                            {mExps.map((ex) => (
-                              <span key={ex.id} className="h-1.5 w-1.5 rounded-full" style={{ background: ex.amount < 0 ? "#34d399" : "#22d3ee" }} />
-                            ))}
+                            {dayExpenses.map((ex) => {
+                              const pal = paletteFor(ex.paidBy, allPeople);
+                              const col = ex.isPayment ? "#34d399" : ex.amount < 0 ? "#34d399" : pal.dot;
+                              return <span key={ex.id} className="h-1.5 w-1.5 rounded-full" style={{ background: col }} />;
+                            })}
                           </div>
                         )}
                       </div>
@@ -806,22 +1270,23 @@ export default function Home() {
                   })}
                 </div>
 
-                {/* Dot legend */}
                 <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5">
-                  {[
-                    { color: "#f472b6", label: "Eduardo expense" },
-                    { color: "#22d3ee", label: "Martha expense" },
-                    { color: "#34d399", label: "Refund" },
-                  ].map((l) => (
-                    <span key={l.label} className="flex items-center gap-1.5 text-xs" style={{ color: "#64748b" }}>
-                      <span className="h-1.5 w-1.5 rounded-full" style={{ background: l.color }} />
-                      {l.label}
-                    </span>
-                  ))}
+                  {allPeople.map((p) => {
+                    const pal = paletteFor(p, allPeople);
+                    return (
+                      <span key={p} className="flex items-center gap-1.5 text-xs" style={{ color: "#64748b" }}>
+                        <span className="h-1.5 w-1.5 rounded-full" style={{ background: pal.dot }} />
+                        {p}
+                      </span>
+                    );
+                  })}
+                  <span className="flex items-center gap-1.5 text-xs" style={{ color: "#64748b" }}>
+                    <span className="h-1.5 w-1.5 rounded-full" style={{ background: "#34d399" }} />
+                    Refund / Payment
+                  </span>
                 </div>
               </GlassPanel>
 
-              {/* Legend */}
               <GlassPanel className="p-4">
                 <p className="text-xs font-semibold tracking-widest uppercase mb-3" style={{ color: "#22d3ee" }}>Key dates</p>
                 <div className="space-y-2.5">
@@ -855,7 +1320,6 @@ export default function Home() {
                 </div>
               </GlassPanel>
 
-              {/* Days left */}
               {rental.plannedMoveOutDate && (() => {
                 const out = new Date(rental.plannedMoveOutDate + "T12:00:00");
                 const today = new Date();
