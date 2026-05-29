@@ -113,32 +113,6 @@ function personShare(e: Expense, person: string): number {
   return e.amount * ((w[person] ?? 1) / totalW);
 }
 
-type SettlementRow = { debtor: string; creditor: string; amount: number };
-
-function computeSettlementData(net: Record<string, number>): SettlementRow[] {
-  const bal = Object.entries(net)
-    .map(([name, b]) => ({ name, b }))
-    .sort((a, c) => c.b - a.b);
-
-  const rows: SettlementRow[] = [];
-  let hi = 0, lo = bal.length - 1;
-
-  while (hi < lo) {
-    while (hi < lo && bal[hi].b < 0.005) hi++;
-    while (hi < lo && bal[lo].b > -0.005) lo--;
-    if (hi >= lo) break;
-    const amount = Math.min(bal[hi].b, -bal[lo].b);
-    if (amount > 0.005) {
-      rows.push({ debtor: bal[lo].name, creditor: bal[hi].name, amount });
-      bal[hi].b -= amount;
-      bal[lo].b += amount;
-    }
-    if (bal[hi].b < 0.005) hi++;
-    if (bal[lo].b > -0.005) lo--;
-  }
-  return rows;
-}
-
 function buildCalendar(anchor: string) {
   const focus = anchor ? new Date(anchor + "T12:00:00") : new Date();
   const year = focus.getFullYear();
@@ -366,7 +340,7 @@ function SplitPicker({
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export default function Home() {
-  const todayIso = new Date().toISOString().split("T")[0];
+  const [todayIso, setTodayIso] = useState("");
 
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [rental, setRental] = useState<RentalInfo>(initialRental);
@@ -384,16 +358,22 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<"expenses" | "rental" | "calendar">("expenses");
   const [syncLabel, setSyncLabel] = useState(isFirebaseConfigured ? "Connecting…" : "Local mode");
   const [isAdding, setIsAdding] = useState(false);
-  const [isLoggingPayment, setIsLoggingPayment] = useState(false);
-  const [paymentForm, setPaymentForm] = useState({ from: "Martha", to: "Eduardo", amount: "", date: todayIso, note: "" });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState(blankForm);
-  const [calendarAnchor, setCalendarAnchor] = useState(() => new Date().toISOString().split("T")[0]);
+  const [calendarAnchor, setCalendarAnchor] = useState("");
 
   const allPeople = useMemo(
     () => [...CORE_PEOPLE, ...(rental.thirdPerson.trim() ? [rental.thirdPerson.trim()] : [])],
     [rental.thirdPerson]
   );
+
+  // Set today's date client-side to avoid SSR/client hydration mismatch
+  useEffect(() => {
+    const today = new Date().toISOString().split("T")[0];
+    setTodayIso(today);
+    setCalendarAnchor(today);
+    setForm((f) => ({ ...f, date: today }));
+  }, []);
 
   // Firebase / localStorage sync
   useEffect(() => {
@@ -440,37 +420,19 @@ export default function Home() {
     const dueExpenses = expenses.filter(dueNow);
     const upcomingExpenses = expenses.filter((e) => !dueNow(e));
     const totalAll = expenses.filter((e) => !e.isPayment).reduce((s, e) => s + e.amount, 0);
+    const totalDue = dueExpenses.filter((e) => !e.isPayment).reduce((s, e) => s + e.amount, 0);
     const totalUpcoming = upcomingExpenses.filter((e) => !e.isPayment).reduce((s, e) => s + e.amount, 0);
-
-    // Net from due expenses only (= total owed before any payments)
-    const netExpenses: Record<string, number> = Object.fromEntries(allPeople.map((p) => [p, 0]));
-    for (const e of dueExpenses.filter((e) => !e.isPayment)) {
-      netExpenses[e.paidBy] = (netExpenses[e.paidBy] ?? 0) + e.amount;
-      for (const p of effectiveSplit(e)) {
-        netExpenses[p] = (netExpenses[p] ?? 0) - personShare(e, p);
-      }
-    }
-
-    // Net including payments (= remaining balance)
-    const netAll: Record<string, number> = { ...netExpenses };
-    for (const e of dueExpenses.filter((e) => e.isPayment)) {
-      netAll[e.paidBy] = (netAll[e.paidBy] ?? 0) + e.amount;
-      for (const p of effectiveSplit(e)) {
-        netAll[p] = (netAll[p] ?? 0) - personShare(e, p);
-      }
-    }
-
-    // Build settlement pairs: total owed → remaining after payments
-    const rawRows = computeSettlementData(netExpenses);
-    const remainingRows = computeSettlementData(netAll);
-    const settlementPairs = rawRows.map((r) => {
-      const rem = remainingRows.find((x) => x.debtor === r.debtor && x.creditor === r.creditor);
-      return { debtor: r.debtor, creditor: r.creditor, total: r.amount, remaining: rem?.amount ?? 0 };
-    });
 
     const paid: Record<string, number> = Object.fromEntries(allPeople.map((p) => [p, 0]));
     for (const e of expenses) {
       if (!e.isPayment) paid[e.paidBy] = (paid[e.paidBy] ?? 0) + e.amount;
+    }
+
+    const shares: Record<string, number> = Object.fromEntries(allPeople.map((p) => [p, 0]));
+    for (const e of dueExpenses.filter((ex) => !ex.isPayment)) {
+      for (const p of effectiveSplit(e)) {
+        shares[p] = (shares[p] ?? 0) + personShare(e, p);
+      }
     }
 
     const nearestUpcoming = [...upcomingExpenses]
@@ -478,10 +440,10 @@ export default function Home() {
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
 
     return {
-      totalAll, totalUpcoming,
+      totalAll, totalDue, totalUpcoming,
       count: expenses.filter((e) => !e.isPayment).length,
       upcomingCount: upcomingExpenses.filter((e) => !e.isPayment).length,
-      paid, settlementPairs, nearestUpcoming,
+      paid, shares, nearestUpcoming,
     };
   }, [expenses, allPeople, todayIso]);
 
@@ -554,28 +516,6 @@ export default function Home() {
     setIsAdding(false);
   }
 
-  async function handleLogPayment(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    const amt = parseFloat(paymentForm.amount);
-    if (isNaN(amt) || amt <= 0 || paymentForm.from === paymentForm.to) return;
-    const next: Expense = {
-      id: crypto.randomUUID(),
-      title: `${paymentForm.from} → ${paymentForm.to}`,
-      amount: amt,
-      paidBy: paymentForm.from,
-      category: "Payment",
-      note: paymentForm.note.trim(),
-      createdAt: paymentForm.date || todayIso,
-      splitBetween: [paymentForm.to],
-      isPayment: true,
-    };
-    const nextList = [next, ...expenses].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    setExpenses(nextList);
-    await persist(nextList, rental);
-    setPaymentForm({ from: "Martha", to: "Eduardo", amount: "", date: todayIso, note: "" });
-    setIsLoggingPayment(false);
-  }
-
   function startEdit(e: Expense) {
     setEditingId(e.id);
     setEditForm({
@@ -590,7 +530,6 @@ export default function Home() {
       dueNow: e.dueNow,
     });
     setIsAdding(false);
-    setIsLoggingPayment(false);
   }
 
   async function handleSaveEdit(ev: FormEvent<HTMLFormElement>) {
@@ -667,64 +606,30 @@ export default function Home() {
           {/* Hero metrics — 2 cards */}
           <div className="mt-5 grid grid-cols-2 gap-3">
             <GlassPanel className="p-4 text-center">
-              <p className="text-xs mb-1" style={{ color: "#64748b" }}>Total spend</p>
-              <p className="text-base font-bold bg-gradient-to-r from-cyan-400 to-indigo-400 bg-clip-text text-transparent">{fmt(summary.totalAll)}</p>
+              <p className="text-xs mb-1" style={{ color: "#64748b" }}>Current total</p>
+              <p className="text-base font-bold bg-gradient-to-r from-cyan-400 to-indigo-400 bg-clip-text text-transparent">{fmt(summary.totalDue)}</p>
             </GlassPanel>
             <GlassPanel className="p-4 text-center">
               <p className="text-xs mb-1" style={{ color: "#64748b" }}>{upcomingCard.label}</p>
               <p className="text-base font-bold bg-gradient-to-r from-violet-400 to-pink-400 bg-clip-text text-transparent">{upcomingCard.value}</p>
+              {summary.upcomingCount > 0 && (
+                <p className="text-xs mt-1" style={{ color: "#475569" }}>not in split yet</p>
+              )}
             </GlassPanel>
           </div>
 
-          {/* Balance tracker */}
-          {summary.settlementPairs.filter((p) => p.remaining >= 0.005).length === 0 ? (
-            <div className="mt-3 rounded-2xl px-4 py-3 flex items-center gap-3" style={{ background: "rgba(52,211,153,0.08)", border: "1px solid rgba(52,211,153,0.18)" }}>
-              <div className="h-2 w-2 rounded-full shrink-0" style={{ background: "#34d399", boxShadow: "0 0 8px #34d399" }} />
-              <p className="text-sm font-medium" style={{ color: "#34d399" }}>All settled</p>
-            </div>
-          ) : (
-            summary.settlementPairs.filter((p) => p.remaining >= 0.005).map(({ debtor, creditor, total, remaining }) => {
-              const paid = total - remaining;
-              const pct = total > 0 ? Math.min(100, (paid / total) * 100) : 0;
-              const isSettled = remaining < 0.005;
+          {/* Shares */}
+          <div className="mt-3 flex gap-3">
+            {allPeople.map((p) => {
+              const pal = paletteFor(p, allPeople);
               return (
-                <div key={`${debtor}-${creditor}`} className="mt-3 rounded-2xl px-4 py-3" style={{ background: "rgba(34,211,238,0.08)", border: "1px solid rgba(34,211,238,0.15)" }}>
-                  <p className="text-xs font-semibold tracking-wide mb-2.5" style={{ color: "#22d3ee" }}>
-                    {debtor} → {creditor}
-                  </p>
-                  <div className="flex items-end justify-between gap-4">
-                    <div>
-                      <p className="text-xs mb-0.5" style={{ color: "#64748b" }}>Total share</p>
-                      <p className="text-sm font-bold text-white">{fmt(total)}</p>
-                    </div>
-                    <div className="text-right">
-                      <p className="text-xs mb-0.5" style={{ color: "#64748b" }}>Remaining</p>
-                      <p className="text-sm font-bold" style={{ color: "#fbbf24" }}>
-                        {fmt(remaining)}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="mt-2.5 h-1.5 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.06)" }}>
-                    <div
-                      className="h-full rounded-full transition-all duration-500"
-                      style={{
-                        width: `${pct}%`,
-                        background: isSettled ? "#34d399" : "linear-gradient(90deg,#34d399,#22d3ee)",
-                      }}
-                    />
-                  </div>
-                  {paid > 0.005 && (
-                    <p className="text-xs mt-1" style={{ color: "#475569" }}>{fmt(paid)} paid</p>
-                  )}
+                <div key={p} className="flex-1 rounded-2xl px-4 py-3 text-center" style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)" }}>
+                  <p className="text-xs mb-1" style={{ color: "#64748b" }}>{p}&apos;s share</p>
+                  <p className="text-base font-bold" style={{ color: pal.text }}>{fmt(summary.shares[p] ?? 0)}</p>
                 </div>
               );
-            })
-          )}
-          {summary.totalUpcoming > 0 && (
-            <div className="mt-2 rounded-xl px-3 py-2" style={{ background: "rgba(251,191,36,0.07)", border: "1px solid rgba(251,191,36,0.15)" }}>
-              <p className="text-xs" style={{ color: "#fbbf24" }}>+ {fmt(summary.totalUpcoming)} upcoming (not yet due)</p>
-            </div>
-          )}
+            })}
+          </div>
 
           {/* Bar chart */}
           <GlassPanel className="mt-3 p-4">
@@ -780,31 +685,18 @@ export default function Home() {
           {activeTab === "expenses" && (
             <div className="mt-4 space-y-3">
               {/* Action buttons */}
-              {!isAdding && !isLoggingPayment && !editingId && (
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setIsAdding(true)}
-                    className="flex-1 py-3.5 rounded-2xl text-sm font-semibold transition-all hover:opacity-90 active:scale-95 flex items-center justify-center gap-2"
-                    style={{ background: "linear-gradient(135deg, #22d3ee, #818cf8)", color: "white" }}
-                  >
-                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                    </svg>
-                    Add expense
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setIsLoggingPayment(true)}
-                    className="py-3.5 px-4 rounded-2xl text-sm font-semibold transition-all hover:opacity-90 active:scale-95 flex items-center justify-center gap-2"
-                    style={{ background: "rgba(52,211,153,0.12)", color: "#34d399", border: "1px solid rgba(52,211,153,0.2)" }}
-                  >
-                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                    </svg>
-                    Payment
-                  </button>
-                </div>
+              {!isAdding && !editingId && (
+                <button
+                  type="button"
+                  onClick={() => setIsAdding(true)}
+                  className="w-full py-3.5 rounded-2xl text-sm font-semibold transition-all hover:opacity-90 active:scale-95 flex items-center justify-center gap-2"
+                  style={{ background: "linear-gradient(135deg, #22d3ee, #818cf8)", color: "white" }}
+                >
+                  <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                  </svg>
+                  Add expense
+                </button>
               )}
 
               {/* Add expense form */}
@@ -880,54 +772,6 @@ export default function Home() {
                       </button>
                       <button type="submit" className="flex-1 py-3 rounded-xl text-sm font-semibold transition-all hover:opacity-90" style={{ background: "linear-gradient(135deg, #22d3ee, #818cf8)", color: "white" }}>
                         Save
-                      </button>
-                    </div>
-                  </form>
-                </GlassPanel>
-              )}
-
-              {/* Log payment form */}
-              {isLoggingPayment && (
-                <GlassPanel className="p-5">
-                  <PanelHeader eyebrow="Payment received" title="Record a settlement" />
-                  <form onSubmit={handleLogPayment} className="space-y-3">
-                    <div className="grid grid-cols-2 gap-3">
-                      <InputField label="From (sent money)">
-                        <select
-                          value={paymentForm.from}
-                          onChange={(e) => setPaymentForm((f) => ({ ...f, from: e.target.value, to: e.target.value === f.to ? allPeople.find(p => p !== e.target.value) ?? f.to : f.to }))}
-                          style={inputStyle}
-                        >
-                          {allPeople.map((p) => <option key={p} value={p}>{p}</option>)}
-                        </select>
-                      </InputField>
-                      <InputField label="To (received money)">
-                        <select
-                          value={paymentForm.to}
-                          onChange={(e) => setPaymentForm((f) => ({ ...f, to: e.target.value }))}
-                          style={inputStyle}
-                        >
-                          {allPeople.filter((p) => p !== paymentForm.from).map((p) => <option key={p} value={p}>{p}</option>)}
-                        </select>
-                      </InputField>
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <InputField label="Amount">
-                        <input type="number" inputMode="decimal" step="0.01" placeholder="0.00" value={paymentForm.amount} onChange={(e) => setPaymentForm((f) => ({ ...f, amount: e.target.value }))} style={inputStyle} autoFocus />
-                      </InputField>
-                      <InputField label="Date">
-                        <input type="date" value={paymentForm.date} onChange={(e) => setPaymentForm((f) => ({ ...f, date: e.target.value }))} style={{ ...inputStyle, colorScheme: "dark" }} />
-                      </InputField>
-                    </div>
-                    <InputField label="Note (optional)">
-                      <input type="text" placeholder="Venmo, cash, etc." value={paymentForm.note} onChange={(e) => setPaymentForm((f) => ({ ...f, note: e.target.value }))} style={inputStyle} />
-                    </InputField>
-                    <div className="flex gap-2 pt-1">
-                      <button type="button" onClick={() => setIsLoggingPayment(false)} className="flex-1 py-3 rounded-xl text-sm font-medium transition-all" style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8", border: "1px solid rgba(255,255,255,0.08)" }}>
-                        Cancel
-                      </button>
-                      <button type="submit" className="flex-1 py-3 rounded-xl text-sm font-semibold transition-all hover:opacity-90" style={{ background: "linear-gradient(135deg, #34d399, #22d3ee)", color: "white" }}>
-                        Record
                       </button>
                     </div>
                   </form>
