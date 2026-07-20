@@ -30,6 +30,7 @@ type RentalInfo = {
   unitLabel: string;
   note: string;
   thirdPerson: string;
+  contributionAdjustments?: Record<string, number>;
 };
 
 type DashboardPayload = {
@@ -76,6 +77,7 @@ function initialRental(): RentalInfo {
     unitLabel: "",
     note: "",
     thirdPerson: "",
+    contributionAdjustments: {},
   };
 }
 
@@ -97,6 +99,13 @@ function isExpenseDueNow(e: Expense, todayIso: string): boolean {
 
 function effectiveSplit(e: Expense): string[] {
   return (e.splitBetween?.length ?? 0) >= 1 ? e.splitBetween! : [...CORE_PEOPLE];
+}
+
+function sanitizeContributionAdjustments(adjustments?: Record<string, number>): Record<string, number> {
+  if (!adjustments) return {};
+  return Object.fromEntries(
+    Object.entries(adjustments).map(([person, amount]) => [person, Number.isFinite(amount) ? amount : 0])
+  );
 }
 
 function hasCustomWeights(e: Expense): boolean {
@@ -361,10 +370,18 @@ export default function Home() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState(blankForm);
   const [calendarAnchor, setCalendarAnchor] = useState("");
+  const [contributionEditorPerson, setContributionEditorPerson] = useState<string | null>(null);
+  const [transferFromPerson, setTransferFromPerson] = useState("");
+  const [transferDraft, setTransferDraft] = useState("");
 
   const allPeople = useMemo(
     () => [...CORE_PEOPLE, ...(rental.thirdPerson.trim() ? [rental.thirdPerson.trim()] : [])],
     [rental.thirdPerson]
+  );
+
+  const contributionAdjustments = useMemo(
+    () => sanitizeContributionAdjustments(rental.contributionAdjustments),
+    [rental.contributionAdjustments]
   );
 
   // Set today's date client-side to avoid SSR/client hydration mismatch
@@ -428,6 +445,10 @@ export default function Home() {
       if (!e.isPayment) paid[e.paidBy] = (paid[e.paidBy] ?? 0) + e.amount;
     }
 
+    const adjustedPaid: Record<string, number> = Object.fromEntries(
+      allPeople.map((p) => [p, (paid[p] ?? 0) + (contributionAdjustments[p] ?? 0)])
+    );
+
     const shares: Record<string, number> = Object.fromEntries(allPeople.map((p) => [p, 0]));
     for (const e of dueExpenses.filter((ex) => !ex.isPayment)) {
       for (const p of effectiveSplit(e)) {
@@ -443,9 +464,9 @@ export default function Home() {
       totalAll, totalDue, totalUpcoming,
       count: expenses.filter((e) => !e.isPayment).length,
       upcomingCount: upcomingExpenses.filter((e) => !e.isPayment).length,
-      paid, shares, nearestUpcoming,
+      paid, adjustedPaid, shares, nearestUpcoming,
     };
-  }, [expenses, allPeople, todayIso]);
+  }, [expenses, allPeople, contributionAdjustments, todayIso]);
 
   // Upcoming hero card label + value
   const upcomingCard = useMemo(() => {
@@ -584,6 +605,43 @@ export default function Home() {
     await persist(expenses, next);
   }
 
+  function openContributionEditor(person: string) {
+    const fallback = allPeople.find((p) => p !== person) ?? "";
+    setContributionEditorPerson(person);
+    setTransferFromPerson(fallback);
+    setTransferDraft("");
+  }
+
+  function closeContributionEditor() {
+    setContributionEditorPerson(null);
+    setTransferFromPerson("");
+    setTransferDraft("");
+  }
+
+  async function saveContributionTransfer() {
+    if (!contributionEditorPerson || !transferFromPerson || contributionEditorPerson === transferFromPerson) return;
+    const parsed = parseFloat(transferDraft);
+    if (!Number.isFinite(parsed) || parsed <= 0) return;
+    const maxTransfer = Math.max(0, summary.adjustedPaid[transferFromPerson] ?? 0);
+    const amount = Math.min(parsed, maxTransfer);
+    if (amount <= 0) return;
+    const nextAdjustments = { ...contributionAdjustments };
+    nextAdjustments[contributionEditorPerson] = (nextAdjustments[contributionEditorPerson] ?? 0) + amount;
+    nextAdjustments[transferFromPerson] = (nextAdjustments[transferFromPerson] ?? 0) - amount;
+    const nextRental = { ...rental, contributionAdjustments: nextAdjustments };
+    setRental(nextRental);
+    await persist(expenses, nextRental);
+    closeContributionEditor();
+  }
+
+  const transferPreviewAmount =
+    contributionEditorPerson && transferFromPerson
+      ? Math.min(
+          Math.max(0, Number.isFinite(parseFloat(transferDraft)) ? parseFloat(transferDraft) : 0),
+          Math.max(0, summary.adjustedPaid[transferFromPerson] ?? 0)
+        )
+      : 0;
+
   // ─── Render ────────────────────────────────────────────────────────────────
 
   return (
@@ -635,16 +693,22 @@ export default function Home() {
           <GlassPanel className="mt-3 p-4">
             <div className="flex items-center justify-between mb-3">
               {allPeople.map((p) => (
-                <div key={p} className="flex-1 text-center">
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => openContributionEditor(p)}
+                  className="flex-1 text-center"
+                  style={{ background: "transparent", border: 0, padding: 0 }}
+                >
                   <p className="text-xs font-medium mb-0.5" style={{ color: "#94a3b8" }}>{p}</p>
-                  <p className="text-lg font-bold text-white">{fmt(summary.paid[p] ?? 0)}</p>
-                </div>
+                  <p className="text-lg font-bold text-white">{fmt(summary.adjustedPaid[p] ?? 0)}</p>
+                </button>
               ))}
             </div>
             <div className="flex gap-1.5 h-2 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.06)" }}>
               {summary.totalAll > 0 && allPeople.map((p) => {
                 const pal = paletteFor(p, allPeople);
-                const pct = ((summary.paid[p] ?? 0) / summary.totalAll) * 100;
+                const pct = ((summary.adjustedPaid[p] ?? 0) / summary.totalAll) * 100;
                 return pct > 0 ? (
                   <div key={p} className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: pal.gradient }} />
                 ) : null;
@@ -662,6 +726,91 @@ export default function Home() {
               })}
             </div>
           </GlassPanel>
+
+          {contributionEditorPerson && (
+            <GlassPanel className="mt-3 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold tracking-widest uppercase mb-1" style={{ color: "#22d3ee" }}>Contribution transfer</p>
+                  <h3 className="text-base font-bold text-white">{contributionEditorPerson}</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeContributionEditor}
+                  className="h-8 w-8 rounded-xl text-sm"
+                  style={{ background: "rgba(255,255,255,0.05)", color: "#94a3b8", border: "1px solid rgba(255,255,255,0.08)" }}
+                  aria-label="Close contribution editor"
+                >
+                  ×
+                </button>
+              </div>
+              <div className="mt-4 grid grid-cols-2 gap-3">
+                <div className="rounded-2xl px-3 py-2" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
+                  <p className="text-[0.7rem]" style={{ color: "#64748b" }}>Currently shown for {contributionEditorPerson}</p>
+                  <p className="text-sm font-semibold text-white">{fmt(summary.adjustedPaid[contributionEditorPerson] ?? 0)}</p>
+                </div>
+                <div className="rounded-2xl px-3 py-2" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
+                  <p className="text-[0.7rem]" style={{ color: "#64748b" }}>Original contribution</p>
+                  <p className="text-sm font-semibold text-white">{fmt(summary.paid[contributionEditorPerson] ?? 0)}</p>
+                </div>
+              </div>
+              <div className="mt-4 grid grid-cols-2 gap-3">
+                <InputField label={`Increase ${contributionEditorPerson}'s contribution using`}>
+                  <select value={transferFromPerson} onChange={(e) => setTransferFromPerson(e.target.value)} style={inputStyle}>
+                    {allPeople.filter((p) => p !== contributionEditorPerson).map((p) => (
+                      <option key={p} value={p}>{p}</option>
+                    ))}
+                  </select>
+                </InputField>
+                <InputField label="Amount to transfer">
+                  <input
+                    type="number"
+                    inputMode="decimal"
+                    min="0"
+                    step="0.01"
+                    value={transferDraft}
+                    onChange={(e) => setTransferDraft(e.target.value)}
+                    style={inputStyle}
+                    autoFocus
+                  />
+                </InputField>
+              </div>
+              {transferFromPerson && (
+                <div className="mt-4 grid grid-cols-2 gap-3">
+                  <div className="rounded-2xl px-3 py-2" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
+                    <p className="text-[0.7rem]" style={{ color: "#64748b" }}>{transferFromPerson} after transfer</p>
+                    <p className="text-sm font-semibold text-white">
+                      {fmt(Math.max(0, (summary.adjustedPaid[transferFromPerson] ?? 0) - transferPreviewAmount))}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl px-3 py-2" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
+                    <p className="text-[0.7rem]" style={{ color: "#64748b" }}>{contributionEditorPerson} after transfer</p>
+                    <p className="text-sm font-semibold text-white">
+                      {fmt((summary.adjustedPaid[contributionEditorPerson] ?? 0) + transferPreviewAmount)}
+                    </p>
+                  </div>
+                </div>
+              )}
+              <div className="mt-4 flex gap-2">
+                <button
+                  type="button"
+                  onClick={closeContributionEditor}
+                  className="flex-1 py-2.5 rounded-xl text-sm font-medium transition-all"
+                  style={{ background: "rgba(255,255,255,0.06)", color: "#94a3b8", border: "1px solid rgba(255,255,255,0.08)" }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void saveContributionTransfer()}
+                  className="flex-1 py-2.5 rounded-xl text-sm font-semibold transition-all hover:opacity-90"
+                  style={{ background: "linear-gradient(135deg, #22d3ee, #818cf8)", color: "white" }}
+                >
+                  Save internal transfer
+                </button>
+              </div>
+            </GlassPanel>
+          )}
 
           {/* Tab bar */}
           <div className="mt-5 flex gap-2 p-1 rounded-2xl" style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)" }}>
